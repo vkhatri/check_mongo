@@ -4,6 +4,7 @@ require 'json'
 require 'mongo'
 
 options = { :host => '127.0.0.1', :port => 27_017, :user => nil, :password => nil, :timeout => 5 }
+valid_checks = %w(connect rs_cluster secondary_nodes node_state total_db_size connect_time queues connections).sort
 
 OptionParser.new do |opt|
   opt.banner = "Usage: #{$PROGRAM_NAME} command <options>"
@@ -11,7 +12,6 @@ OptionParser.new do |opt|
   opt.separator ''
   opt.separator 'Plugin options:'
 
-  # opt.on('-i', '--invert', 'invert thresholds (less than instead of greater than or equal to)') { |h| options[:invert] = true }
   opt.on('-H', '--host [HOSTADDRESS]', 'mongodb host address, default: 127.0.0.1') { |h| options[:host] = h }
   opt.on('-P', '--port [PORT]', 'mongodb port, default: 6379') { |h| options[:port] = h }
   opt.on('-u', '--user [USER]', 'mongodb user, default: nil') { |h| options[:password] = h }
@@ -30,7 +30,6 @@ OptionParser.new do |opt|
   end
 end.parse!
 
-valid_checks = %w(connect rs_cluster secondary_nodes node_state total_db_size connect_time queues connections).sort
 run_checks = options[:checks].map { |o| o.split(':')[0] }.sort
 unknown_checks = run_checks - valid_checks
 
@@ -52,7 +51,10 @@ class CheckMongoDB
     @critical_checks = ''
     @warning_checks = ''
     @ok_checks = ''
+
+    # default check thresholds
     @thresholds = {
+      :check_total_connections => { :warning => 10_000, :critical => 20_000 },
       :check_connections => { :warning => 80, :critical => 90 },
       :check_queues => { :warning => 200, :critical => 300 },
       :check_total_db_size => { :warning => 25.0, :critical => 50.0 },
@@ -62,6 +64,7 @@ class CheckMongoDB
     }
   end
 
+  # connect to mongo instance
   def connect
     s = Time.now
     @connection = Mongo::Connection.new(opts[:host], opts[:port], :op_timeout => opts[:timeout], :slave_ok => true)
@@ -76,10 +79,13 @@ class CheckMongoDB
     @databases = connection.database_names
     @admin = connection.db('admin')
     cmd = BSON::OrderedHash.new
+
+    # fetch server status info
     cmd['serverStatus'] = { 'repl' => 2 }
     @stats = admin.command(cmd, :check_response => false)
 
     if replica_set?
+      # fetch replica set status
       cmd = BSON::OrderedHash.new
       cmd['replSetGetStatus'] = { 'members' => 1 }
       @rsstats = admin.command(cmd, :check_response => false)
@@ -91,7 +97,7 @@ class CheckMongoDB
   end
 
   def replica_set?
-    @stats['repl'].key?('setName') ? true : false
+    stats['repl'].key?('setName') ? true : false
   end
 
   def master?
@@ -141,14 +147,14 @@ class CheckMongoDB
     end
   end
 
+  # check connectivity and report basic info
   def check_connect(_w = nil, _c = nil, i)
     message = "MongoDB #{node_type.capitalize} node, "
     message << "ReplicaSet: #{replica_set_name}, " if replica_set_name
     message << "Version: #{stats['version']}, "
     message << "Storage: #{stats['storageEngine']['name']}, "
-    days, hrs, mins, secs = [24, 60, 60].reverse.inject([stats['uptime'].to_i]) do|result, unitsize|
+    days, hrs, mins, secs = [24, 60, 60].reverse.each_with_object([stats['uptime'].to_i]) do |unitsize, result|
       result[0, 0] = result.shift.divmod(unitsize)
-      result
     end
 
     message << "DB Count: #{databases.count} "
@@ -156,6 +162,7 @@ class CheckMongoDB
     assemble_message(message, nil, nil, nil, i)
   end
 
+  # check replica set state
   def check_rs_cluster(w = nil, c = nil, i)
     if replica_set?
       primary = 0
@@ -172,21 +179,22 @@ class CheckMongoDB
         end
       end
       message = ''
-      threshold = ''
+      severity = ''
       if primary > 0 && secondary > 0 && arbiter > 0
         message = "Replicate Set OK: primary: #{primary}, secondary: #{secondary}, arbiter: #{arbiter}"
       else
         message = "Replicate Set Not OK: primary: #{primary}, secondary: #{secondary}, arbiter: #{arbiter}"
-        threshold = 'CRITICAL'
+        severity = 'CRITICAL'
       end
-      assemble_message(message, nil, nil, nil, nil, threshold)
+      assemble_message(message, nil, nil, nil, nil, severity)
 
     else
       message = 'Node is not configured with Replica Set'
-      assemble_message(message, value, w, c, i, threshold)
+      assemble_message(message, value, w, c, i, severity)
     end
   end
 
+  # check numbers of secondary nodes in a replica set
   def check_secondary_nodes(w = nil, c = nil, i)
     w ||= thresholds[:check_secondary_nodes][:warning]
     c ||= thresholds[:check_secondary_nodes][:critical]
@@ -202,23 +210,26 @@ class CheckMongoDB
     end
   end
 
+  # check state of replica set members
   def check_node_state(w = nil, c = nil, i)
     # http://docs.mongodb.org/manual/reference/replica-states/
     # w ||= thresholds[:check_node_state][:warning]
     # c ||= thresholds[:check_node_state][:critical]
     if replica_set?
-      threshold = ''
+      severity = ''
       value = rsstats['myState']
       message = "Node State: #{value}"
       @exit_perfdata << "node_state=#{value};; "
-      threshold = 'CRITICAL' unless [1, 2, 7].include?(value)
-      assemble_message(message, value, w, c, i, threshold)
+      severity = 'CRITICAL' unless [1, 2, 7].include?(value)
+      assemble_message(message, value, w, c, i, severity)
     else
       message = 'Node is not configured with Replica Set'
       assemble_message(message, value, w, c, i)
     end
   end
 
+  # check total db size and also print
+  # size of each db
   def check_total_db_size(w = nil, c = nil, i)
     w ||= thresholds[:check_total_db_size][:warning]
     c ||= thresholds[:check_total_db_size][:critical]
@@ -237,6 +248,7 @@ class CheckMongoDB
     assemble_message(message, total_size, w, c, i)
   end
 
+  # check connect time
   def check_connect_time(w = nil, c = nil, i)
     w ||= thresholds[:check_connect_time][:warning]
     c ||= thresholds[:check_connect_time][:critical]
@@ -246,6 +258,7 @@ class CheckMongoDB
     assemble_message(message, value, w, c, i)
   end
 
+  # check queues size
   def check_queues(w = nil, c = nil, i)
     w ||= thresholds[:check_queues][:warning]
     c ||= thresholds[:check_queues][:critical]
@@ -257,6 +270,17 @@ class CheckMongoDB
     assemble_message(message, value, w, c, i)
   end
 
+  # check total connections limit
+  def check_total_connections(w = nil, c = nil, i = true)
+    w ||= thresholds[:check_connections][:warning]
+    c ||= thresholds[:check_connections][:critical]
+    conns = stats['connections']
+    value = conns['current'] + conns['available']
+    message = "Total Connections: #{value}"
+    assemble_message(message, value, w, c, i)
+  end
+
+  # check % connections used
   def check_connections(w = nil, c = nil, i)
     w ||= thresholds[:check_connections][:warning]
     c ||= thresholds[:check_connections][:critical]
@@ -272,26 +296,26 @@ class CheckMongoDB
     assemble_message(message, value, w, c, i)
   end
 
-  def assemble_message(message, value, warning, critical, invert, threshold = '')
+  # add check result message to the output
+  def assemble_message(message, value, warning, critical, invert, severity = '')
     if critical && value && ((invert && value.to_f < critical.to_f) || (!invert && value.to_f >= critical.to_f))
       @critical_checks << "CRIT: #{message};"
     elsif warning && value && ((invert && value.to_f < warning.to_f) || (!invert && value.to_f >= warning.to_f))
       @warning_checks << "WARN: #{message};"
-    elsif threshold == 'CRITICAL'
+    elsif severity == 'CRITICAL'
       @critical_checks << "CRIT: #{message};"
-    elsif threshold == 'WARNING'
+    elsif severity == 'WARNING'
       @warning_checks << "WARN: #{message};"
     elsif message
       @ok_checks << "OK: #{message};"
     end
   end
 
+  # collect different checks result
   def run
     opts[:checks].each do |check|
       name, w, c, i = check.split(':')
-      # puts "n=#{name}, w=#{w},c=#{c},i=#{i}"
       i = i.to_i == 1 ? true : false
-      # puts "n=#{name}, w=#{w},c=#{c},i=#{i}"
       send("check_#{name}", w, c, i)
     end
 
