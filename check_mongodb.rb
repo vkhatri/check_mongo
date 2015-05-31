@@ -2,9 +2,10 @@
 require 'optparse'
 require 'json'
 require 'mongo'
+require 'time'
 
 options = { :host => '127.0.0.1', :port => 27_017, :user => nil, :password => nil, :timeout => 5 }
-valid_checks = %w(connect rs_cluster secondary_nodes node_state total_db_size connect_time queues connections).sort
+valid_checks = %w(connect rs_cluster secondary_nodes node_state total_db_size connect_time queues connections sync_lag).sort
 
 OptionParser.new do |opt|
   opt.banner = "Usage: #{$PROGRAM_NAME} command <options>"
@@ -60,7 +61,8 @@ class CheckMongoDB
       :check_total_db_size => { :warning => 25.0, :critical => 50.0 },
       :check_node_state => { :warning => 6, :critical => 8 },
       :check_connect_time => { :warning => 1.0, :critical => 2.0 },
-      :check_secondary_nodes => { :warning => 1, :critical => 1 }
+      :check_secondary_nodes => { :warning => 1, :critical => 1 },
+      :check_sync_lag => { :warning => 180, :critical => 300 }
     }
   end
 
@@ -81,7 +83,8 @@ class CheckMongoDB
     cmd = BSON::OrderedHash.new
 
     # fetch server status info
-    cmd['serverStatus'] = { 'repl' => 2 }
+    cmd['serverStatus'] = 1
+    cmd['repl'] = 2
     @stats = admin.command(cmd, :check_response => false)
 
     if replica_set?
@@ -294,6 +297,64 @@ class CheckMongoDB
     # TODO: add warn and crit thresholds to perf data
     @exit_perfdata << "connections=#{current};; "
     assemble_message(message, value, w, c, i)
+  end
+
+  # check replication lag
+  def check_sync_lag(w = nil, c = nil, i)
+    w ||= thresholds[:check_sync_lag][:warning]
+    c ||= thresholds[:check_sync_lag][:critical]
+    if replica_set?
+      self_state = nil
+      primary_node = nil
+      self_optimedate = nil
+      primary_optimedate = nil
+      replica_set = rsstats['set']
+
+      rsstats['members'].each do |m|
+        if m['self']
+          self_optimedate = Time.parse m['optimeDate'].to_s if m.key?('optimeDate')
+          self_state = m['state']
+        end
+
+        if m['state'] == 1
+          primary_node = m['name']
+          primary_optimedate = Time.parse m['optimeDate'].to_s
+        end
+      end
+
+      case self_state
+      when 2
+        if !primary_node
+          message = "Replica Set #{replica_set} missing Primary node"
+          assemble_message(message, nil, nil, nil, i, 'CRITICAL')
+        else
+          value = primary_optimedate - self_optimedate
+          message = "Replica Set #{replica_set} Secondary Replication is #{value}s behind from Primary #{primary_node}"
+          @exit_perfdata << "sync_lag=#{value};#{w};#{c} "
+          assemble_message(message, value, w, c, i)
+        end
+      when 1, 7
+        message = "Replica Set #{replica_set} node #{state_type(self_state).capitalize} is not a Secondary node"
+        assemble_message(message, nil, nil, nil, i)
+      else
+        message = "Replica Set #{replica_set} node state #{self_state} is unknown"
+        assemble_message(message, nil, nil, nil, i, 'CRITICAL')
+      end
+    else
+      if master?
+        message = 'Master/Slave Replication Node is master'
+        assemble_message(message, nil, nil, nil, i)
+      elsif slave?
+        syncto = stats['repl']['sources'][0]['host']
+        value = stats['repl']['sources'][0]['lagSeconds'].to_i
+        message = "Slave Replication is #{value}s behind from Master #{syncto}"
+        @exit_perfdata << "sync_lag=#{value};#{w};#{c} "
+        assemble_message(message, value, w, c, i)
+      else
+        message = 'Node is not configured with --replSet or --slave or --master'
+        assemble_message(message, value, w, c, i)
+      end
+    end
   end
 
   # add check result message to the output
